@@ -16,30 +16,72 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      # Find the Gradle project at the repository root or one folder below it.
-      # This also gives a clear error when only the workflow file was committed.
-      - name: Locate Gradle project
+      # Supports either an extracted Gradle project or a source ZIP committed
+      # to the repository (the setup used by this repository at the moment).
+      - name: Locate or extract Gradle project
         id: project
         shell: bash
         run: |
-          if [[ -f build.gradle && -f settings.gradle ]]; then
-            project_dir="."
-          else
-            project_dir=""
+          set -euo pipefail
+
+          find_project() {
+            local root="$1"
+            local build_file candidate
+
+            if [[ ( -f "$root/build.gradle" || -f "$root/build.gradle.kts" ) && \
+                  ( -f "$root/settings.gradle" || -f "$root/settings.gradle.kts" ) ]]; then
+              printf '%s\n' "$root"
+              return 0
+            fi
+
             while IFS= read -r build_file; do
               candidate="${build_file%/*}"
               [[ "$candidate" == "$build_file" ]] && candidate="."
               if [[ -f "$candidate/settings.gradle" || -f "$candidate/settings.gradle.kts" ]]; then
-                project_dir="$candidate"
-                break
+                printf '%s\n' "$candidate"
+                return 0
               fi
-            done < <(find . -mindepth 2 -maxdepth 5 -type f \( -name build.gradle -o -name build.gradle.kts \) -not -path '*/build/*' -print)
+            done < <(find "$root" -mindepth 2 -maxdepth 8 -type f \
+              \( -name build.gradle -o -name build.gradle.kts \) \
+              -not -path '*/.git/*' -not -path '*/build/*' -print | sort)
+            return 1
+          }
+
+          project_dir="$(find_project . || true)"
+
+          if [[ -z "$project_dir" ]]; then
+            archive=""
+            if [[ -f puppeteer-1.20.1-github.zip ]]; then
+              archive="puppeteer-1.20.1-github.zip"
+            else
+              archive="$(find . -maxdepth 1 -type f -iname '*.zip' -print | sort | head -n 1 || true)"
+            fi
+
+            if [[ -n "$archive" ]]; then
+              echo "No extracted Gradle project found; checking archive: $archive"
+              if ! unzip -Z1 "$archive" | grep -Eq '(^|/)build\.gradle(\.kts)?$'; then
+                echo "::error::The ZIP '$archive' does not contain build.gradle or build.gradle.kts."
+                exit 1
+              fi
+
+              extract_dir="$GITHUB_WORKSPACE/.puppeteer-build-source"
+              rm -rf "$extract_dir"
+              mkdir -p "$extract_dir"
+              unzip -oq "$archive" -d "$extract_dir"
+              project_dir="$(find_project "$extract_dir" || true)"
+            fi
           fi
 
           if [[ -z "$project_dir" ]]; then
-            echo "::error::Gradle project files were not found. Commit/extract the full Puppeteer project so build.gradle, settings.gradle, gradle.properties, and src/ are in the repository root (not just .github/workflows/build.yml)."
+            echo "::error::Gradle files not found. Commit the extracted project (build.gradle, settings.gradle, gradle.properties and src/) or place puppeteer-1.20.1-github.zip in the repository root."
             echo "Repository root contains:"
             ls -la
+            exit 1
+          fi
+
+          if [[ ! -f "$project_dir/gradle.properties" || ! -d "$project_dir/src" ]]; then
+            echo "::error::Found Gradle files in '$project_dir', but gradle.properties or src/ is missing."
+            ls -la "$project_dir"
             exit 1
           fi
 
@@ -51,7 +93,6 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-          # Do not set cache: gradle here. setup-gradle below manages Gradle caching.
 
       - name: Set up Gradle 8.7
         uses: gradle/actions/setup-gradle@v6
